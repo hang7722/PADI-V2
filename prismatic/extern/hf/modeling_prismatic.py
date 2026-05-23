@@ -13,6 +13,7 @@ References [LLaVa, IDEFICS-2]:
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -36,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 # === PyTorch/HuggingFace Default IGNORE_INDEX (for CrossEntropyLoss labels)
 IGNORE_INDEX = -100
+
+
+def _cuda_sync_if_available() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 # === Utility Functions for Monkey-Patching ===
@@ -257,9 +263,32 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.fastv_image_token_start_index = getattr(config, 'fastv_image_token_start_index', 5)
         self.fastv_image_token_length = getattr(config, 'fastv_image_token_length', 256)
         self.use_text_vision_selection = getattr(config, 'use_text_vision_selection', False)
+        self.measure_latency = getattr(config, "measure_latency", False)
+        self.last_llm_latency_ms = None
+        self.last_llm_step_latency_ms = None
+        self.last_llm_forward_count = 0
+        self._llm_latency_accum_ms = 0.0
         
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
+
+    def _call_language_model_with_latency(self, fn, **kwargs):
+        measure = bool(getattr(self, "measure_latency", getattr(self.config, "measure_latency", False)))
+        if not measure:
+            return fn(**kwargs)
+
+        _cuda_sync_if_available()
+        t0 = time.perf_counter()
+        out = fn(**kwargs)
+        _cuda_sync_if_available()
+        t1 = time.perf_counter()
+
+        dt_ms = float((t1 - t0) * 1000.0)
+        self._llm_latency_accum_ms = float(getattr(self, "_llm_latency_accum_ms", 0.0)) + dt_ms
+        self.last_llm_step_latency_ms = dt_ms
+        self.last_llm_forward_count = int(getattr(self, "last_llm_forward_count", 0)) + 1
+        self.last_llm_latency_ms = self._llm_latency_accum_ms
+        return out
 
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
@@ -331,7 +360,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert past_key_values is not None, "You must provide `past_key_values` during cached generation!"
             assert labels is None, "Unexpected key `labels` provided during cached generation!"
 
-            language_model_output = self.language_model(
+            language_model_output = self._call_language_model_with_latency(
+                self.language_model,
                 input_ids=input_ids,
                 attention_mask=None,
                 position_ids=None,
@@ -349,7 +379,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert (input_ids is not None) and (inputs_embeds is None), "Missing `input_ids` in language-only forward!"
             assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
 
-            language_model_output = self.language_model(
+            language_model_output = self._call_language_model_with_latency(
+                self.language_model,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=None,
@@ -405,7 +436,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 multimodal_labels = torch.cat([labels[:, :1], projected_patch_labels, labels[:, 1:]], dim=1)
             if self.use_fastv:
                 if hasattr(self.language_model, 'fastv_forward'):
-                    language_model_output = self.language_model.fastv_forward(
+                    language_model_output = self._call_language_model_with_latency(
+                        self.language_model.fastv_forward,
                         inputs_embeds=multimodal_embeddings,
                         attention_mask=multimodal_attention_mask,
                         position_ids=None,
@@ -419,7 +451,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                     )
                 else:
                     print("Warning: FastV not supported by language model, falling back to standard forward")
-                    language_model_output = self.language_model(
+                    language_model_output = self._call_language_model_with_latency(
+                        self.language_model,
                         input_ids=None,
                         attention_mask=multimodal_attention_mask,
                         position_ids=None,
@@ -432,7 +465,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                         return_dict=return_dict,
                     )
             else:
-                language_model_output = self.language_model(
+                language_model_output = self._call_language_model_with_latency(
+                    self.language_model,
                     input_ids=None,
                     attention_mask=multimodal_attention_mask,
                     position_ids=None,
@@ -559,6 +593,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self, input_ids: Optional[torch.LongTensor] = None, unnorm_key: Optional[str] = None, **kwargs: str
     ) -> np.ndarray:
         """Thin wrapper around .generate() that decodes predicted actions and unnormalizes them."""
+        measure = bool(getattr(self, "measure_latency", getattr(self.config, "measure_latency", False)))
+        if measure:
+            self._llm_latency_accum_ms = 0.0
+            self.last_llm_latency_ms = None
+            self.last_llm_step_latency_ms = None
+            self.last_llm_forward_count = 0
+        self.last_pruning_info = None
         if not torch.all(input_ids[:, -1] == 29871):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
@@ -609,6 +650,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
         else:
             results = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
+        self.last_pruning_info = getattr(self.language_model, "pruning_info", None)
+        if measure:
+            self.last_llm_latency_ms = float(getattr(self, "_llm_latency_accum_ms", 0.0))
+            self.last_llm_forward_count = int(getattr(self, "last_llm_forward_count", 0))
         attentions = results.attentions
         action_vision_attentions, text_vision_attentions, prefill_attentions = self._extract_action_modality_attentions(attentions, pruning_info=getattr(self.language_model, 'pruning_info', None))
         if action_vision_attentions is not None and action_vision_attentions.numel() > 0:
@@ -721,4 +766,3 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Get all the logged statistics for the given dataset."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
-

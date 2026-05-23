@@ -298,6 +298,12 @@ def get_vla(cfg):
         vla.use_text_vision_selection = cfg.use_text_vision_selection
         vla.use_prefil_attention = cfg.use_prefil_attention
 
+    measure_latency = bool(getattr(cfg, "measure_latency", False))
+    vla.measure_latency = measure_latency
+    vla.config.measure_latency = measure_latency
+    if hasattr(vla, "language_model") and hasattr(vla.language_model, "config"):
+        vla.language_model.config.measure_latency = measure_latency
+
     use_temporal = getattr(cfg, 'use_temporal', getattr(cfg, 'use_temproal', False))
     temporal_w = getattr(cfg, 'temporal_w', getattr(cfg, 'temproal_w', 5))
     temporal_gamma = getattr(cfg, 'temporal_gamma', getattr(cfg, 'temproal_gamma', 0.8))
