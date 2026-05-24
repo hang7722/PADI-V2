@@ -36,6 +36,8 @@ from experiments.robot.libero.libero_utils import (
     save_rollout_video,
 )
 from experiments.robot.openvla_utils import get_processor
+from padi_v2.runtime.physics_runtime import PadiPhysicsAwareRuntime, PadiPhysicsConfig
+from padi_v2.runtime.video_overlay import overlay_padi_scores_on_frame
 from experiments.robot.robot_utils import (
     DATE_TIME,
     get_action,
@@ -67,6 +69,10 @@ class GenerateConfig:
     measure_latency: bool = False
     latency_warmup_queries: int = 3
     latency_log_per_query: bool = False
+    use_padi_runtime: bool = False
+    padi_debug: bool = False
+    padi_video_overlay: bool = False
+    padi_overlay_position: str = "top_left"
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################
@@ -161,6 +167,20 @@ def eval_libero(cfg: GenerateConfig) -> None:
     )
     print(latency_cfg_msg)
     log_file.write(latency_cfg_msg + "\n")
+    if cfg.use_padi_runtime:
+        padi_cfg_msg = f"[PADI-V2 Config][PADI] profile=openvla_calibrated debug={cfg.padi_debug} video_overlay={cfg.padi_video_overlay} overlay_position={cfg.padi_overlay_position}"
+        print(padi_cfg_msg)
+        log_file.write(padi_cfg_msg + "\n")
+    if cfg.padi_video_overlay and not cfg.use_padi_runtime:
+        padi_overlay_warn = "[PADI-V2 Config][PADI] warning: padi_video_overlay=True but use_padi_runtime=False; overlay will show NO SIGNAL."
+        print(padi_overlay_warn)
+        log_file.write(padi_overlay_warn + "\n")
+    padi_runtime = None
+    if cfg.use_padi_runtime:
+        padi_runtime = PadiPhysicsAwareRuntime(PadiPhysicsConfig())
+        print("[PADI-V2] using OpenVLA-calibrated physics profile")
+        log_file.write("[PADI-V2] using OpenVLA-calibrated physics profile\n")
+
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
@@ -197,6 +217,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             last_caches = None
             latency_records = []
             policy_query_idx = 0
+            latest_padi_out = None
+            padi_episode_telemetry = []
+            if padi_runtime is not None:
+                padi_runtime.reset()
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -218,6 +242,49 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         continue
                     # Get preprocessed image
                     img = get_libero_image(obs, resize_size)
+                    current_padi_out = None
+
+                    # Update PADI runtime for current decision frame (before policy query)
+                    if padi_runtime is not None:
+                        eef_pos = obs.get("robot0_eef_pos") if isinstance(obs, dict) else None
+                        gripper_raw = obs.get("robot0_gripper_qpos") if isinstance(obs, dict) else None
+                        gripper_value = None if gripper_raw is None else float(np.asarray(gripper_raw).reshape(-1).mean())
+                        if eef_pos is None:
+                            if cfg.padi_debug:
+                                padi_msg = f"[PADI-V2 PADI] warning step={t} missing robot0_eef_pos in obs"
+                                print(padi_msg)
+                                log_file.write(padi_msg + "\n")
+                        else:
+                            padi_out = padi_runtime.update(eef_pos=eef_pos, gripper_value=gripper_value, step_idx=t, obs=obs)
+                            current_padi_out = padi_out
+                            latest_padi_out = padi_out
+                            padi_episode_telemetry.append({
+                                "step_idx": t,
+                                "geometry_risk": padi_out.geometry_risk,
+                                "precise_active": padi_out.precise_active,
+                                "transit_score": padi_out.transit_score,
+                                "debug": padi_out.debug,
+                            })
+                            if cfg.padi_debug:
+                                d = padi_out.debug
+                                padi_msg = (
+                                    f"[PADI-V2 PADI] step={t} geometry_risk={padi_out.geometry_risk:.4f} "
+                                    f"precise_active={padi_out.precise_active} transit_score={padi_out.transit_score:.4f} "
+                                    f"gripper_value={gripper_value} gripper_engaged={d.get('gripper_engaged')} "
+                                    f"gripper_stably_closed={d.get('gripper_stably_closed')} carry_active={d.get('carry_active')} "
+                                    f"recent_precise_exit={d.get('recent_precise_exit')} "
+                                    f"recent_mean_speed={d.get('recent_mean_speed', 0.0):.4f} "
+                                    f"recent_mean_disp={d.get('recent_mean_disp', 0.0):.4f} "
+                                    f"total_speed={d.get('total_speed', 0.0):.4f} "
+                                    f"xy_speed={d.get('xy_speed', 0.0):.4f} "
+                                    f"z_speed={d.get('z_speed', 0.0):.4f} "
+                                    f"curvature={d.get('curvature', 0.0):.4f} "
+                                    f"d_z={d.get('d_z', 0.0):.4f} "
+                                    f"local_interaction_candidate={d.get('local_interaction_candidate')} "
+                                    f"precise_candidate={d.get('precise_candidate')}"
+                                )
+                                print(padi_msg)
+                                log_file.write(padi_msg + "\n")
                     # Save previous image
                     if prev_img is None:
                         prev_img = img
@@ -293,6 +360,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             print(query_msg)
                             log_file.write(query_msg + "\n")
                         policy_query_idx += 1
+                    if cfg.padi_video_overlay:
+                        padi_out_for_overlay = current_padi_out if cfg.use_padi_runtime else None
+                        overlay_source = result_image if result_image is not None else img
+                        result_image = overlay_padi_scores_on_frame(
+                            overlay_source,
+                            padi_out_for_overlay,
+                            step_idx=t,
+                            position=cfg.padi_overlay_position,
+                        )
                     replay_images_heatmap.append(result_image)
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
