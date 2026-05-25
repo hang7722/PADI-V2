@@ -5,6 +5,52 @@ from typing import Any, Optional
 import numpy as np
 
 
+def _compute_grid(patches_per_image: int):
+    side = int(np.sqrt(max(1, patches_per_image)))
+    if side * side == patches_per_image:
+        return side, side
+    grid_h = 16
+    grid_w = int(np.ceil(max(1, patches_per_image) / grid_h))
+    return grid_h, grid_w
+
+
+def _tensor_or_array_to_numpy(x):
+    if x is None:
+        return None
+    if hasattr(x, "detach") and hasattr(x, "cpu"):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _overlay_pruned_patches(frame_rgb, local_pruned, patches_per_image, alpha):
+    from PIL import Image
+
+    out = frame_rgb.copy()
+    h, w = out.shape[0], out.shape[1]
+    grid_h, grid_w = _compute_grid(patches_per_image)
+    strength = float(np.clip(alpha / 255.0, 0.0, 0.90))
+    dark_value = 0.03
+
+    for local_idx in local_pruned:
+        row = int(local_idx) // grid_w
+        col = int(local_idx) % grid_w
+        if row < 0 or row >= grid_h:
+            continue
+        x0 = int(round(col * w / grid_w))
+        y0 = int(round(row * h / grid_h))
+        x1 = int(round((col + 1) * w / grid_w))
+        y1 = int(round((row + 1) * h / grid_h))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        patch = out[y0:y1, x0:x1, :]
+        patch_f = patch.astype(np.float32) / 255.0
+        dark = np.ones_like(patch_f) * dark_value
+        masked = patch_f * (1.0 - strength) + dark * strength
+        out[y0:y1, x0:x1, :] = np.clip(masked * 255.0, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(out, mode="RGB")
+
+
 def _to_rgb_uint8(frame: Any) -> np.ndarray:
     arr = np.asarray(frame)
     if arr.ndim == 2:
@@ -112,9 +158,98 @@ def overlay_padi_scores_on_frame(frame, padi_out: Optional[Any], step_idx, posit
     return np.asarray(img).astype(np.uint8)
 
 
+def overlay_fastv_pruning_on_frame(
+    frame,
+    pruning_info,
+    image_token_start_index: int = 1,
+    image_token_length: int = 256,
+    alpha: int = 170,
+    show_label: bool = True,
+    label: str = "Global",
+) -> np.ndarray:
+    from PIL import Image, ImageDraw, ImageFont
+
+    rgb = _to_rgb_uint8(frame)
+    if pruning_info is None:
+        return rgb
+
+    pruned_indices = pruning_info.get("pruned_indices", [])
+    try:
+        if pruned_indices is None:
+            pruned = np.asarray([], dtype=np.int64)
+        else:
+            pruned = np.array(
+                pruned_indices.tolist() if hasattr(pruned_indices, "tolist") else list(pruned_indices),
+                dtype=np.int64,
+            )
+    except Exception:
+        pruned = np.asarray([], dtype=np.int64)
+
+    skipped = bool(pruning_info.get("skipped", False))
+    has_mask = pruning_info is not None and (not skipped) and pruned.size > 0
+    length = max(1, int(image_token_length))
+    if has_mask:
+        start = int(image_token_start_index)
+        end = start + length
+        local_pruned = pruned[(pruned >= start) & (pruned < end)] - start
+        img = _overlay_pruned_patches(
+            rgb,
+            local_pruned,
+            patches_per_image=length,
+            alpha=alpha,
+        )
+    else:
+        img = Image.fromarray(rgb, mode="RGB")
+
+    if show_label:
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", size=max(14, int(img.height * 0.055)))
+        except Exception:
+            font = ImageFont.load_default()
+        text = label
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]
+        x = max(6, (img.width - text_w) // 2)
+        y = max(6, img.height - max(22, int(img.height * 0.10)))
+        draw.text((x, y), text, fill=(245, 245, 245), font=font)
+
+    return np.asarray(img, dtype=np.uint8)
+
+
 def _self_check():
     frame = np.zeros((256, 256, 3), dtype=np.uint8)
     out = overlay_padi_scores_on_frame(frame, None, step_idx=0)
     assert isinstance(out, np.ndarray)
     assert out.dtype == np.uint8
     assert out.ndim == 3 and out.shape[2] == 3
+    pruning_info = {
+        "pruned_indices": np.array([1, 2, 3, 10, 20, 255], dtype=np.int64),
+        "pruning_layer": 3,
+        "skipped": False,
+    }
+    out2 = overlay_fastv_pruning_on_frame(
+        frame,
+        pruning_info,
+        image_token_start_index=1,
+        image_token_length=256,
+    )
+    assert isinstance(out2, np.ndarray)
+    assert out2.dtype == np.uint8
+    assert out2.ndim == 3 and out2.shape[2] == 3
+    pruning_info_empty = {
+        "pruned_indices": np.array([], dtype=np.int64),
+        "skipped": False,
+    }
+    out3 = overlay_fastv_pruning_on_frame(
+        frame,
+        pruning_info_empty,
+        image_token_start_index=1,
+        image_token_length=256,
+        alpha=170,
+        show_label=True,
+        label="Global",
+    )
+    assert isinstance(out3, np.ndarray)
+    assert out3.dtype == np.uint8
+    assert out3.ndim == 3 and out3.shape[2] == 3
